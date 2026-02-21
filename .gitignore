@@ -1,0 +1,17 @@
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+
+# Arduino IDE settings
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit WiFi credentials or API keys
+arduino_secrets.h
+secrets.h
