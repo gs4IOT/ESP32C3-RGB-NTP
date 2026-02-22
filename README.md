@@ -2,7 +2,7 @@
 
 **Version 0.12.1** — BLE configuration release
 
-A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5×5 WS2812B NeoPixel matrix. Inspired by the PV Electronics single digit Nixie clock design. Configured entirely over BLE — no USB or serial required after first flash.
+A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5×5 WS2812B NeoPixel matrix. Inspired by the PV Electronics single digit Nixie clock design based on source code of https://github.com/didn0t/5x5_Clock. Configured entirely over BLE — no USB or serial required after first flash.
 
 ---
 
