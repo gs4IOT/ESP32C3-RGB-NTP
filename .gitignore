@@ -12,6 +12,9 @@ build/
 .DS_Store
 Thumbs.db
 
-# Secrets — never commit WiFi credentials or API keys
+# Secrets -- never commit WiFi credentials or API keys
 arduino_secrets.h
 secrets.h
+
+# Debug builds -- never commit, for local testing only
+*-debug.ino
