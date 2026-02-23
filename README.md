@@ -2,7 +2,7 @@
 
 **Version 0.12.1** — BLE configuration release
 
-A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5×5 WS2812B NeoPixel matrix. Inspired by the PV Electronics single digit Nixie clock design based on source code of https://github.com/didn0t/5x5_Clock. Configured entirely over BLE — no USB or serial required after first flash.
+A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5x5 WS2812B NeoPixel matrix. Inspired by the PV Electronics single digit Nixie clock design based on source code of https://github.com/didn0t/5x5_Clock. Configured entirely over BLE — no USB or serial required after first flash.
 
 ---
 
@@ -11,7 +11,7 @@ A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5×5
 | Component | Detail |
 | --- | --- |
 | Board | 01Space ESP32-C3FH4-RGB |
-| Display | 25× WS2812B NeoPixel (5×5 matrix), pin 8 |
+| Display | 25x WS2812B NeoPixel (5x5 matrix), pin 8 |
 | Button | Built-in button, pin 9 |
 | Status LED | Built-in blue LED, pin 10 |
 
@@ -22,12 +22,13 @@ A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5×5
 - Syncs time via NTP on boot using saved WiFi credentials
 - Displays time in amber every 20 seconds
 - Displays date in blue on every minute change (DDMMYY format)
-- Timezone configurable via BLE — saved to flash, survives reboots
+- Timezone configurable via BLE `tz:` command — saved to flash, applies on next reboot
 - WiFi credentials sent over BLE — no portal or USB needed after first flash
-- Long press button (3s) re-opens BLE pairing mode while clock is running
-- Status LED lights up while connecting or BLE device is connected
+- Long press button (3s) opens BLE while clock is running
+- Status LED lights while connecting or BLE device is connected
 - Non-blocking animations — no `delay()`, watchdog safe
-- Reduced WiFi TX power (`WIFI_POWER_11dBm`) to lower current draw
+- Reduced WiFi TX power (`WIFI_POWER_11dBm`) to prevent brownout on cold boot
+- BLE auto-timeout: 3 minutes with no connection, 1 minute after disconnect
 
 ---
 
@@ -35,12 +36,17 @@ A WiFi-synced NTP clock running on the 01Space ESP32-C3FH4-RGB board with a 5×5
 
 The ESP32-C3 has a **single shared radio** for both WiFi and BLE. They cannot run simultaneously. The firmware handles this by:
 
-1. **Boot with no credentials** → BLE starts, waits for `ssid:` / `pass:` commands
-2. **Boot with saved credentials** → WiFi connects, syncs NTP, WiFi off, BLE does not auto-start
-3. **Long press button** → BLE starts manually after NTP is already synced
-4. **NTP re-sync** → BLE advertising paused, WiFi connects, syncs, WiFi off
+1. **First boot (no credentials)** — BLE starts, waits for `ssid:` / `pass:` commands, reboots after saving
+2. **Normal boot (credentials saved)** — WiFi connects, syncs NTP, WiFi off, both radios idle
+3. **Long press button** — BLE starts manually, auto-shuts off after timeout
+4. **Timezone change** — saved to flash via BLE, applied on next reboot when WiFi is active
 
-BLE uses `stopAdvertising()` before WiFi — not `deinit()` — to avoid a 60-second blocking delay.
+Key lessons learned:
+- `BLEDevice::deinit()` blocks for up to 60 seconds — use `stopAdvertising()` for short pauses
+- `myTZ.setLocation()` requires active WiFi — cannot apply timezone while BLE is running
+- WiFi TX power must be set inside `syncNTP()` before `WiFi.begin()` — not in `setup()`
+- Android BLE WRITE_NR caps at 20 bytes regardless of MTU negotiation
+- `PROPERTY_WRITE_NR` required on ESP32-C3 — plain `WRITE` silently drops callbacks
 
 ---
 
@@ -50,59 +56,68 @@ The firmware exposes a BLE UART-style service with two characteristics:
 
 | Direction | UUID | Property |
 | --- | --- | --- |
-| Phone → Clock (RX) | `abcd1234-ab12-ab12-ab12-abcdef012345` | WRITE_NR |
-| Clock → Phone (TX) | `abcd1235-ab12-ab12-ab12-abcdef012345` | READ + NOTIFY |
+| Phone to Clock (RX) | `abcd1234-ab12-ab12-ab12-abcdef012345` | WRITE_NR |
+| Clock to Phone (TX) | `abcd1235-ab12-ab12-ab12-abcdef012345` | READ + NOTIFY |
 
-> **Note:** `PROPERTY_WRITE_NR` is required on ESP32-C3. Plain `WRITE` silently drops callbacks.
+### Commands (phone to clock)
 
-### Commands (phone → clock)
-
-All commands must be **under 20 bytes** due to Android BLE WRITE_NR MTU limits.
+All commands must be **under 20 bytes** due to Android BLE WRITE_NR limit.
 
 | Command | Example | Description |
 | --- | --- | --- |
 | `ssid:` | `ssid:MyNetwork` | Buffer the WiFi SSID (send before `pass:`) |
-| `pass:` | `pass:MyPassword` | Buffer password, save both to flash, reboot |
-| `tz:` | `tz:America/Edmonton` | Change timezone, save to flash, apply immediately |
-| `scan` | `scan` | Scan WiFi networks — returns SSID, RSSI, encryption |
+| `pass:` | `pass:MyPassword` | Save credentials to flash, reboot |
+| `tz:` | `tz:America/Edmonton` | Save timezone to flash, applies on next reboot |
 | `time?` | `time?` | Return current local time string |
 
-### Responses (clock → phone)
+### Responses (clock to phone)
 
 | Response | Meaning |
 | --- | --- |
-| `ssid_ok` | SSID buffered successfully |
+| `ssid_ok -- now send pass:` | SSID buffered successfully |
 | `wifi_saved -- rebooting` | Credentials saved, clock rebooting |
-| `tz_ok` | Timezone applied and saved |
-| `tz_err` | Invalid IANA timezone string |
-| `networks:SSID(rssi,enc),...` | WiFi scan results |
+| `tz_saved -- reboot to apply` | Timezone saved, will apply on next reboot |
 | `err:send ssid: first` | `pass:` received without prior `ssid:` |
-| `err:not synced yet` | `time?` received before NTP sync |
-| `err:unknown cmd` | Unrecognised command |
+| `err:no time sync yet` | `time?` received before NTP sync |
+| `err:unknown` | Unrecognised command |
 
-> **Note:** `ssid:` and `pass:` are sent as separate commands to stay under the 20-byte BLE write limit.
+> **Note:** `ssid:` and `pass:` are sent as separate commands to stay under the 20-byte BLE write limit. Non-ASCII characters in SSID (e.g. Cyrillic) use 2 bytes each and will truncate — use ASCII-only network names.
+
+---
+
+## BLE Auto-Timeout
+
+BLE shuts off automatically to keep radios idle during normal clock operation:
+
+| Condition | Timeout |
+| --- | --- |
+| No phone connects after button press | 3 minutes |
+| Phone disconnects | 1 minute |
+
+After timeout both radios are off. Press button 3s to re-enable BLE.
 
 ---
 
 ## Required Libraries
 
-Install via Arduino IDE → Tools → Manage Libraries:
+Install via Arduino IDE — Tools — Manage Libraries:
 
 | Library | Author |
 | --- | --- |
 | Adafruit NeoPixel | Adafruit |
 | ezTime | Rop Gonggrijp |
 
-`Preferences`, `WiFi`, and `BLE*` libraries are built into the ESP32 Arduino core — no install needed.
+`Preferences`, `WiFi`, and `BLE*` are built into the ESP32 Arduino core — no install needed.
 
 ---
 
 ## File Structure
 
 ```
-ESP32C3-RGB-NTP.ino   — main logic, BLE server, NTP sync, display loop
-font.h                — 5×5 pixel font definitions
-timezones.h           — IANA timezone reference list
+ESP32C3-RGB-BLE-v0.12.1.ino   -- main logic, BLE server, NTP sync, display loop
+ESP32C3-RGB-NTP.ino            -- v0.11.1 WiFiManager version (kept for reference)
+font.h                         -- 5x5 pixel font definitions
+timezones.h                    -- IANA timezone reference list (v0.11.1 only)
 ```
 
 ---
@@ -113,51 +128,66 @@ timezones.h           — IANA timezone reference list
 | --- | --- |
 | Board | ESP32C3 Dev Module |
 | USB CDC On Boot | Enabled |
-| Upload Speed | 921600 |
+| CPU Frequency | 160MHz (WiFi) |
 | Flash Size | 4MB |
+| Partition Scheme | Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS) |
+| Upload Speed | 921600 |
+| Erase All Flash | Disabled (enable only for first upload) |
+
+> **Partition scheme is critical** — default partition is too small for BLE + WiFi together.
 
 ---
 
 ## First Upload
 
 > **Full flash erase required before first upload.**
-> Tools → Erase All Flash Before Sketch Upload → Enabled, upload once, then disable.
+> Tools — Erase All Flash Before Sketch Upload — Enabled, upload once, then disable.
 
-This clears any stale `Preferences` data that can cause BLE or WiFi issues.
+This clears stale `Preferences` data that can cause BLE or WiFi issues on first boot.
 
 ---
 
 ## First Boot (no saved credentials)
 
 1. Power on — matrix shows **"bLE"** then **"cfg"**
-2. Open a BLE terminal app (e.g. Serial Bluetooth Terminal on Android)
+2. Open a BLE terminal app (e.g. LightBlue or nRF Connect)
 3. Connect to **FingerClock**
-4. Send `ssid:YourNetwork` (under 20 bytes)
+4. Send `ssid:YourNetwork` (under 20 bytes, ASCII only)
 5. Send `pass:YourPassword`
 6. Clock replies `wifi_saved -- rebooting` and restarts
-7. On reboot it connects to WiFi, syncs NTP, shows **"Up"**
+7. On reboot — WiFi connects, NTP syncs, matrix shows **"Up"**
+
+---
+
+## Normal Boot (credentials saved)
+
+1. Power on — matrix shows **"ntp"**
+2. WiFi connects and NTP syncs
+3. Matrix shows **"Up"** then time display begins
+4. Both radios go idle — no WiFi, no BLE
 
 ---
 
 ## Changing WiFi or Timezone While Running
 
-Hold the button on **pin 9 for 3 seconds**. The status LED turns solid blue and the matrix shows **"PAr"** — BLE starts and you can send new credentials or a `tz:` command.
+Hold the button on **pin 9 for 3 seconds**. Matrix shows **"bLE"**, status LED turns on, BLE starts advertising.
 
-- Sending new `ssid:` / `pass:` saves credentials and reboots
-- Sending `tz:` applies immediately and saves to flash — no reboot needed
+- Send new `ssid:` + `pass:` — saves and reboots
+- Send `tz:America/Vancouver` — saves to flash, reboot to apply
+- BLE shuts off after 3 minutes idle or 1 minute after disconnect
 
 ---
 
 ## Timing Constants
 
-All timing constants are at the top of `ESP32C3-RGB-NTP.ino`:
-
 | Constant | Default | Description |
 | --- | --- | --- |
 | `TIME_REFRESH_MS` | 20000 | How often time redraws (ms) |
-| `FADE_STEP_MS` | 30 | Speed of fade animation per brightness step (ms) |
+| `FADE_STEP_MS` | 30 | Speed of fade animation per step (ms) |
 | `FADE_HOLD_MS` | 200 | How long character stays at full brightness (ms) |
 | `LONG_PRESS_MS` | 3000 | Button hold time to open BLE (ms) |
+| `BLE_ADVERTISE_TIMEOUT_MS` | 180000 | BLE off if no connection (ms) |
+| `BLE_DISCONNECT_TIMEOUT_MS` | 60000 | BLE off after disconnect (ms) |
 
 ---
 
@@ -172,21 +202,41 @@ All timing constants are at the top of `ESP32C3-RGB-NTP.ino`:
 
 ---
 
+## Matrix Messages
+
+| Message | Colour | Meaning |
+| --- | --- | --- |
+| `ntp` | Red | Connecting to WiFi and syncing time |
+| `Up` | Green | Boot successful, time synced |
+| `Err` | Red | WiFi or NTP failed |
+| `bLE` | Blue | BLE starting |
+| `cfg` | Amber | Waiting for BLE credentials |
+| `rbt` | Green | Rebooting after credentials saved |
+| `ok` | Green | Command accepted |
+
+---
+
 ## Serial Monitor
 
 Connect at **115200 baud** to see status output:
 
 ```
 [+] FingerClock v0.12.1 booting...
-[+] Pausing BLE before WiFi...
 [+] Connecting to: MyNetwork
 [+] WiFi connected -- syncing NTP
-[+] UTC: Saturday, 21-Feb-2026 08:03:18 UTC
-[+] TZ OK: America/Edmonton
-[+] Local: Saturday, 21-Feb-2026 10:03:18 EET
-[BLE] Phone connected
-[BLE] Received: time?
-[BLE] Phone disconnected
+[+] UTC: Sunday, 22-Feb-2026 22:43:37 UTC
+[+] TZ OK: America/Vancouver
+[+] Local: Sunday, 22-Feb-2026 14:43:37 PST
+[+] WiFi off -- hold button to start BLE
+[+] Button held...
+[!] Long press -- restarting BLE
+[BLE] Starting...
+[BLE] Advertising -- connect with nRF Connect or LightBlue
+[BLE] Phone connected -- MTU: 512
+[BLE] Received: tz:America/Edmonton
+[BLE] TZ saved (applies on reboot): America/Edmonton
+[BLE] Phone disconnected -- BLE off in 1 min
+[BLE] Post-disconnect timeout -- shutting off
 ```
 
 ---
@@ -207,10 +257,11 @@ prefs.end();
 
 ## Known Limitations (v0.12.1)
 
-- No BLE security — pairing is open, will be added in a future version
-- WiFi scan (`scan` command) cannot run while BLE is connected — shared radio limitation
-- Android BLE caps WRITE_NR at 20 bytes regardless of MTU negotiation — keep all commands short
-- BLE does not auto-start after NTP sync — requires long press button
+- No BLE security — pairing is open, planned for a future version
+- Android BLE caps WRITE_NR at 20 bytes regardless of MTU — keep all commands short
+- Non-ASCII SSID names (Cyrillic etc.) truncate at 20 bytes — use ASCII network names
+- Timezone changes require reboot to apply — `myTZ.setLocation()` needs active WiFi
+- First cold boot may brownout reset once before succeeding — second boot always clean
 
 ---
 
@@ -218,15 +269,18 @@ prefs.end();
 
 ### v0.12.1
 - BLE configuration replaces WiFiManager portal
-- WiFi credentials sent via BLE `ssid:` / `pass:` commands — split to stay under 20-byte BLE limit
-- Timezone configurable via BLE `tz:` command
-- `scan` command returns WiFi networks with RSSI and encryption type
+- WiFi credentials sent via `ssid:` / `pass:` — split to stay under 20-byte BLE limit
+- Credentials saved to flash, board reboots after saving — prevents radio conflict on first config
+- Timezone via `tz:` command — saved to flash, applied on next reboot
 - `time?` command returns current local time string
 - `PROPERTY_WRITE_NR` used on RX characteristic — required on ESP32-C3
-- BLE and WiFi radio switching handled cleanly — `stopAdvertising()` used instead of `deinit()`
-- Reduced WiFi TX power to `WIFI_POWER_11dBm`
+- BLE and WiFi never run simultaneously — clean radio sequencing
+- WiFi TX power set to `WIFI_POWER_11dBm` — prevents brownout on cold boot
+- BLE auto-timeout: 3 min no connect, 1 min after disconnect
 - Status LED indicates BLE connection state
-- Long press button restarts BLE while clock is running
+- Long press button (3s) starts BLE while clock is running
+- Both radios idle after NTP sync — BLE only on demand
+- `scan` command removed — cannot run WiFi scan while BLE stack is active
 
 ### v0.11.1
 - AP name and password configurable via WiFiManager portal
@@ -237,10 +291,9 @@ prefs.end();
 - Performance: `strip.show()` moved outside drawing loop
 - Non-blocking `wait()` with `yield()` replaces all `delay()` calls
 - Timezone saved to flash with `Preferences`
-- Font improvements: `n`, `o`, `I` redesigned for 5×5 legibility
+- Font improvements: `n`, `o`, `I` redesigned for 5x5 legibility
 - Variable shadowing fixed in `DrawPixel()`
 - `FadeString()` uses `const char*` — no heap fragmentation
-- Off-by-one fixed in `FadeString()` loop
 
 ---
 

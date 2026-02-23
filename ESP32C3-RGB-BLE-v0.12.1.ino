@@ -1,10 +1,13 @@
 // ESP32C3 RGB NTP v0.12.1
-// BLE basic version -- BLE config, no WiFi scan with RSSI/encryption, no security yet
-// Main issue is that radio interference prevents us from runing both system simultaneously
-// Key fixes of the BLE issues found:
+// BLE basic version -- BLE config, no security yet
+// Main issue is that radio interference prevents running both radios simultaneously
+// Key fixes:
 //   - PROPERTY_WRITE_NR required on ESP32-C3 (plain WRITE drops callbacks silently)
 //   - ssid: and pass: sent as separate commands to stay under 20 byte BLE write limit
 //   - Full flash erase required before first upload (Tools -> Erase All Flash)
+//   - scan command removed -- cannot run WiFi scan while BLE active (shared radio)
+//   - BLE only starts on first boot (no credentials) or button 3s hold
+//   - After NTP sync WiFi and BLE both off -- radios idle until button pressed
 
 #include <Adafruit_NeoPixel.h>
 #include <ezTime.h>
@@ -67,11 +70,12 @@ bool               bleActive     = false;
 unsigned long      btnPressStart = 0;
 bool               ntpSynced     = false;
 
-// Buffers for split ssid:/pass: commands
-// Android BLE caps WRITE_NR at 20 bytes regardless of MTU negotiation
-// Sending ssid: and pass: separately keeps each write under 20 bytes
-String pendingSSID = "";
-String pendingPass = "";
+// BLE auto-timeout -- shuts BLE off if unused
+// 3 minutes with no connection, 1 minute after disconnect
+#define BLE_ADVERTISE_TIMEOUT_MS  180000
+#define BLE_DISCONNECT_TIMEOUT_MS  60000
+unsigned long bleStartedAt      = 0; // when BLE advertising began
+unsigned long bleDisconnectedAt = 0; // when phone last disconnected
 
 // ---------------------------------------------------------------------------
 // wait() -- non-blocking delay with yield()
@@ -126,8 +130,7 @@ void bleNotify(const char* msg) {
 }
 
 // ---------------------------------------------------------------------------
-// syncNTP() -- stop BLE, connect WiFi, sync time, disconnect, restart BLE
-// BLE and WiFi share the same radio on ESP32-C3 -- must not run together
+// syncNTP() -- connect WiFi briefly, sync time, disconnect
 // ---------------------------------------------------------------------------
 void syncNTP() {
   prefs.begin("clock", true);
@@ -143,25 +146,14 @@ void syncNTP() {
     return;
   }
 
-  // Stop BLE advertising before WiFi -- shared radio, must not transmit together
-  // Using stopAdvertising instead of deinit -- deinit blocks for up to 60s
-  if (bleActive) {
-    Serial.println(F("[+] Pausing BLE before WiFi..."));
-    BLEDevice::stopAdvertising();
-    bleConnected = false;
-    // Yield briefly to let BLE stack finish any in-flight packets
-    unsigned long pause = millis();
-    while (millis() - pause < 500) yield();
-  }
-
   Serial.println("[+] Connecting to: " + ssid);
   digitalWrite(STATUS_LED_PIN, HIGH);
   WiFi.mode(WIFI_STA);
- WiFi.setTxPower(WIFI_POWER_11dBm); // reduce TX power to lower current draw
+  WiFi.setTxPower(WIFI_POWER_11dBm); // reduce TX power to lower current draw
   WiFi.begin(ssid.c_str(), pass.c_str());
 
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {   /// ???
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     yield();
   }
 
@@ -171,7 +163,6 @@ void syncNTP() {
     digitalWrite(STATUS_LED_PIN, LOW);
     WiFi.disconnect();
     WiFi.mode(WIFI_OFF);
-    startBLE(); // restart BLE even after failure
     return;
   }
 
@@ -192,10 +183,7 @@ void syncNTP() {
   WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
   digitalWrite(STATUS_LED_PIN, LOW);
-  // Yield briefly before restarting BLE
-  unsigned long pause = millis();
-  while (millis() - pause < 300) yield();
-  Serial.println(F("[+] WiFi off -- start BLE holding the button"));
+  Serial.println(F("[+] WiFi off -- hold button to start BLE"));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,25 +191,35 @@ void syncNTP() {
 // ---------------------------------------------------------------------------
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
-    bleConnected = true;
+    bleConnected    = true;
+    bleDisconnectedAt = 0; // clear disconnect timer when phone connects
     digitalWrite(STATUS_LED_PIN, HIGH);
-    Serial.println(F("[BLE] Phone connected"));
+    Serial.print(F("[BLE] Phone connected -- MTU: "));
+    Serial.println(BLEDevice::getMTU());
   }
   void onDisconnect(BLEServer* pServer) {
-    bleConnected = false;
+    bleConnected      = false;
+    bleDisconnectedAt = millis(); // start 1 minute shutdown timer
     digitalWrite(STATUS_LED_PIN, LOW);
-    Serial.println(F("[BLE] Phone disconnected"));
-    BLEDevice::startAdvertising();
+    Serial.println(F("[BLE] Phone disconnected -- BLE off in 1 min"));
+    BLEDevice::startAdvertising(); // keep advertising for 1 min in case phone reconnects
   }
 };
 
 // ---------------------------------------------------------------------------
-// BLE RX callbacks -- commands from phone (all kept under 20 bytes):
+// Buffers for split ssid:/pass: commands
+// Android BLE ignores MTU negotiation for WRITE_NR and caps at 20 bytes
+// Sending ssid: and pass: as separate writes keeps each under 20 bytes
+// ---------------------------------------------------------------------------
+String pendingSSID = "";
+String pendingPass = "";
+
+// ---------------------------------------------------------------------------
+// BLE RX callbacks -- commands from phone (all under 20 bytes):
 //
 //   ssid:NetworkName     buffer SSID (send first)
-//   pass:Password        buffer password, save + sync NTP
-//   tz:America/Edmonton  change timezone, save, apply immediately
-//   scan                 return WiFi networks with RSSI and encryption
+//   pass:Password        buffer password, save to flash, reboot
+//   z:America/Edmonton   change timezone, save, apply immediately
 //   time?                return current local time string
 // ---------------------------------------------------------------------------
 class RxCallbacks : public BLECharacteristicCallbacks {
@@ -235,9 +233,10 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (value.startsWith("ssid:")) {
       pendingSSID = value.substring(5);
       Serial.println("[BLE] SSID buffered: " + pendingSSID);
-      bleNotify("ssid_ok");
+      bleNotify("ssid_ok -- now send pass:");
 
     // -- pass:Password -------------------------------------------------
+    // Triggers save + NTP sync once both ssid and pass are received
     } else if (value.startsWith("pass:")) {
       pendingPass = value.substring(5);
       Serial.println(F("[BLE] Pass buffered"));
@@ -249,18 +248,25 @@ class RxCallbacks : public BLECharacteristicCallbacks {
         prefs.putString("pass", String(wifiPass));
         prefs.end();
         Serial.println("[BLE] WiFi saved: " + String(wifiSSID));
-        bleNotify("wifi_saved -- rebooting");
+        bleNotify("wifi_saved -- syncing NTP...");
         pendingSSID = "";
         pendingPass = "";
-        FadeString(COL_GREEN, "rbt");
-        unsigned long pause = millis();
-        while (millis() - pause < 500) yield(); // let notify send before reboot
-        ESP.restart();
+        FadeString(COL_BLUE, "ntp");
+        syncNTP();
+        if (ntpSynced) {
+          FadeString(COL_GREEN, "ok");
+          bleNotify("sync_done");
+        } else {
+          FadeString(COL_RED, "Err");
+          bleNotify("sync_failed -- check SSID and password");
+        }
       } else {
         bleNotify("err:send ssid: first");
       }
 
     // -- tz:Timezone ---------------------------------------------------
+    // Tries to apply immediately -- if it fails WiFi may be required
+    // Falls back to saving for next reboot
     } else if (value.startsWith("tz:")) {
       String newTZ = value.substring(3);
       newTZ.toCharArray(tzName, 40);
@@ -272,81 +278,23 @@ class RxCallbacks : public BLECharacteristicCallbacks {
         bleNotify("tz_ok");
         FadeString(COL_GREEN, "ok");
       } else {
-        Serial.println(F("[BLE] TZ failed"));
-        bleNotify("tz_err");
-        FadeString(COL_RED, "Err");
+        Serial.println("[BLE] TZ saved (applies on reboot): " + String(tzName));
+        bleNotify("tz_saved -- reboot to apply");
+        FadeString(COL_GREEN, "ok");
       }
-
-    // -- scan should be removed couldnt run both radio at the same time ---
-    } else if (value == "scan") {
-      Serial.println(F("[BLE] WiFi scan started..."));
-      FadeString(COL_BLUE, "scn");
-      bleNotify("scanning...");
-
-      // Pause BLE advertising before scan -- shared radio
-      if (bleActive) {
-        BLEDevice::stopAdvertising();
-        bleConnected = false;
-        unsigned long pause = millis();
-        while (millis() - pause < 500) yield();
-      }
-
-      WiFi.mode(WIFI_STA);
-      int found = WiFi.scanNetworks();
-
-      WiFi.mode(WIFI_OFF);
-      // Yield briefly before restarting BLE
-      unsigned long pause = millis();
-      while (millis() - pause < 500) yield();
-      startBLE(); // restart BLE before sending results
-
-      if (found == 0) {
-        bleNotify("networks:none");
-      } else {
-        String chunk = "networks:";
-        for (int i = 0; i < found; i++) {
-          String enc;
-          switch (WiFi.encryptionType(i)) {
-            case WIFI_AUTH_OPEN:            enc = "OPEN";  break;
-            case WIFI_AUTH_WEP:             enc = "WEP";   break;
-            case WIFI_AUTH_WPA_PSK:         enc = "WPA";   break;
-            case WIFI_AUTH_WPA2_PSK:        enc = "WPA2";  break;
-            case WIFI_AUTH_WPA_WPA2_PSK:    enc = "WPA/2"; break;
-            case WIFI_AUTH_WPA2_ENTERPRISE: enc = "ENT";   break;
-            case WIFI_AUTH_WPA3_PSK:        enc = "WPA3";  break;
-            default:                        enc = "UNK";   break;
-          }
-          String entry = WiFi.SSID(i)
-                       + "(" + String(WiFi.RSSI(i)) + ","
-                       + enc + ")";
-          if (chunk.length() + entry.length() + 1 > 480) {
-            Serial.println("[BLE] Scan chunk: " + chunk);
-            bleNotify(chunk.c_str());
-            unsigned long chunkPause = millis();
-            while (millis() - chunkPause < 100) yield();
-            chunk = "nets+:";
-          }
-          chunk += entry;
-          if (i < found - 1) chunk += ",";
-        }
-        Serial.println("[BLE] Scan chunk: " + chunk);
-        bleNotify(chunk.c_str());
-      }
-      WiFi.scanDelete();
-      FadeString(COL_GREEN, "ok");
 
     // -- time? ---------------------------------------------------------
     } else if (value == "time?") {
       if (ntpSynced) {
         bleNotify(myTZ.dateTime("H:i:s d/m/Y T").c_str());
       } else {
-        bleNotify("err:not synced yet");
+        bleNotify("err:no time sync yet -- send ssid: and pass: first");
       }
 
     // -- unknown -------------------------------------------------------
     } else {
       Serial.println(F("[BLE] Unknown command"));
-      bleNotify("err:unknown cmd");
+      bleNotify("err:unknown -- valid cmds: ssid: pass: z: time?");
     }
   }
 };
@@ -354,14 +302,15 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 // ---------------------------------------------------------------------------
 // startBLE() -- init BLE server and start advertising
 // WRITE_NR required on ESP32-C3 -- plain WRITE silently drops callbacks
-// No security in v0.12.1 -- will be added later in next version
+// MTU set to 512 -- default 20 byte MTU truncates long wifi: commands
+// No security in v0.12.1 -- bonding added in v0.13.0
 // ---------------------------------------------------------------------------
 void startBLE() {
   if (bleActive) return;
   Serial.println(F("[BLE] Starting..."));
 
   BLEDevice::init("FingerClock");
-  BLEDevice::setMTU(512);
+  BLEDevice::setMTU(512); // must be set before createServer()
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
@@ -369,7 +318,7 @@ void startBLE() {
 
   BLECharacteristic* pCharRX = pService->createCharacteristic(
     CHAR_UUID_RX,
-    BLECharacteristic::PROPERTY_WRITE_NR // WRITE_NR required on ESP32-C3
+    BLECharacteristic::PROPERTY_WRITE_NR  // WRITE_NR required on ESP32-C3
   );
   pCharRX->setCallbacks(new RxCallbacks());
 
@@ -378,12 +327,14 @@ void startBLE() {
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
   );
   pCharTX->addDescriptor(new BLE2902());
-  pCharTX->setValue("FingerClock v0.12.1");
+  pCharTX->setValue("FingerClock v0.12.1 ready");
 
   pService->start();
   BLEDevice::startAdvertising();
-  bleActive = true;
-  Serial.println(F("[BLE] Advertising"));
+  bleActive         = true;
+  bleStartedAt      = millis(); // start 3 minute no-connection timeout
+  bleDisconnectedAt = 0;        // clear disconnect timer
+  Serial.println(F("[BLE] Advertising -- connect with nRF Connect or LightBlue"));
 }
 
 // ---------------------------------------------------------------------------
@@ -409,10 +360,11 @@ void setup() {
     // No credentials yet -- start BLE, wait for ssid:/pass: commands
     Serial.println(F("[!] No WiFi saved -- waiting for BLE config"));
     FadeString(COL_BLUE, "bLE");
-    startBLE();   
+    startBLE();
     FadeString(COL_AMBER, "cfg");
   } else {
-    // Normal boot -- sync NTP (BLE starts inside syncNTP after WiFi done)
+    // Normal boot -- sync NTP, then both radios off
+    // BLE only starts again on button 3s hold
     FadeString(COL_RED, "ntp");
     syncNTP();
     if (ntpSynced) {
@@ -420,6 +372,7 @@ void setup() {
     } else {
       FadeString(COL_RED, "Err");
     }
+    // No startBLE() here -- radios stay off until button pressed
   }
 }
 
@@ -445,7 +398,29 @@ void loop() {
     }
   }
 
-  // -- Button 3s -- for entering the BLE after NTP synced -----------------------
+  // -- BLE auto-timeout ----------------------------------------------------
+  if (bleActive && !bleConnected) {
+    // 3 minutes with no connection -- shut BLE off
+    if (bleStartedAt > 0 && now - bleStartedAt >= BLE_ADVERTISE_TIMEOUT_MS) {
+      Serial.println(F("[BLE] No connection -- timeout, shutting off"));
+      BLEDevice::deinit(true);
+      bleActive    = false;
+      pServer      = nullptr;
+      pCharTX      = nullptr;
+      bleStartedAt = 0;
+    }
+    // 1 minute after disconnect -- shut BLE off
+    if (bleDisconnectedAt > 0 && now - bleDisconnectedAt >= BLE_DISCONNECT_TIMEOUT_MS) {
+      Serial.println(F("[BLE] Post-disconnect timeout -- shutting off"));
+      BLEDevice::deinit(true);
+      bleActive         = false;
+      pServer           = nullptr;
+      pCharTX           = nullptr;
+      bleDisconnectedAt = 0;
+    }
+  }
+
+  // -- Button 3s -- restart BLE for config ---------------------------------
   if (digitalRead(BTN_PIN) == LOW) {
     if (btnPressStart == 0) {
       btnPressStart = now;
@@ -454,10 +429,17 @@ void loop() {
     }
     if (!btnHandled && now - btnPressStart >= LONG_PRESS_MS) {
       btnHandled = true;
-      Serial.println(F("[!] Long press -- restart BLE "));
-      FadeString(COL_RED, "CLr");
-      FadeString(COL_AMBER, "PAr");
-      startBLE();   // restart BLE after button detected
+      Serial.println(F("[!] Long press -- restarting BLE"));
+      FadeString(COL_BLUE, "bLE");
+      // Deinit fully so startBLE() can reinitialise from scratch
+      if (bleActive) {
+        BLEDevice::deinit(true);
+        bleActive    = false;
+        bleConnected = false;
+        pServer      = nullptr;
+        pCharTX      = nullptr;
+      }
+      startBLE();
     }
   } else {
     if (btnPressStart > 0 && !btnHandled) {
